@@ -1,0 +1,6 @@
+# Only files required by this app may enter the build context.
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!app.js

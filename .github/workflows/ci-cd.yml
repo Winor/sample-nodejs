@@ -1,0 +1,199 @@
+name: Trunk CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: SemVer release (placeholder)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Future release automation
+        run: |
+          echo 'PLACEHOLDER: derive the next SemVer release from merged changes on main.'
+          echo 'No version bumps, Git tags, or GitHub releases are created yet.'
+
+  sast:
+    name: SAST and dependency checks (placeholder)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Future security gate
+        run: |
+          echo 'PLACEHOLDER: run SAST and dependency checks; block on policy violations.'
+          echo 'WARNING: this job does not perform security checks.'
+
+  build:
+    name: Build, smoke-test and publish image
+    needs: [version, sast]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.metadata.outputs.image }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Check application syntax
+        run: node --check app.js
+
+      - name: Prepare image metadata
+        id: metadata
+        env:
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'Expected a stable SemVer package version (X.Y.Z).' >&2
+            exit 1
+          fi
+
+          image="ghcr.io/${REPOSITORY,,}"
+          if [[ "$EVENT_NAME" == 'pull_request' ]]; then
+            tag="${version}-pr.${PR_NUMBER}.sha${COMMIT_SHA}"
+          else
+            tag="${version}-ci.sha${COMMIT_SHA}"
+          fi
+
+          {
+            echo "image=$image"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "ref=$image:$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # No compile step: the Dockerfile installs locked production dependencies
+      # with npm ci and copies app.js, which Node.js executes directly.
+      - name: Build and load image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.metadata.outputs.ref }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.metadata.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # The local Docker load/push path does not retain attestations.
+          provenance: false
+          sbom: false
+
+      - name: Smoke-test the built image
+        env:
+          IMAGE_REF: ${{ steps.metadata.outputs.ref }}
+        run: |
+          container=$(docker run --detach --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges --user 1000:1000 \
+            --publish 127.0.0.1::8080 "$IMAGE_REF")
+          trap 'docker logs "$container"; docker rm --force "$container" >/dev/null' EXIT
+          port=$(docker port "$container" 8080/tcp | awk -F: '{print $NF}')
+
+          for path in ready live my-app metrics; do
+            curl --fail --silent --show-error --max-time 5 \
+              --retry 10 --retry-delay 1 --retry-all-errors --retry-max-time 60 \
+              --output /dev/null "http://127.0.0.1:${port}/${path}"
+          done
+
+      # Fork PRs and manual runs on non-main branches never log in or publish.
+      - name: Log in to GitHub Container Registry
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the tested image
+        id: publish
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ steps.metadata.outputs.ref }}
+        run: |
+          docker push "$IMAGE_REF"
+          reference=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF")
+          echo "digest=${reference#*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Write build summary
+        env:
+          IMAGE_REF: ${{ steps.metadata.outputs.ref }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          {
+            echo '## Build and Dockerize'
+            echo "- Image: \`$IMAGE_REF\`"
+            echo '- Container smoke checks: /ready, /live, /my-app, /metrics'
+            if [[ -n "$DIGEST" ]]; then
+              echo "- Published digest: \`$DIGEST\`"
+            else
+              echo '- Validation only: image was not published.'
+            fi
+            echo '- SemVer releases, security scanning and Argo CD deployment are placeholders.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  image-scan:
+    name: Image vulnerability scan (placeholder)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Future image security gate
+        run: |
+          echo 'PLACEHOLDER: scan the image and fail on high/critical vulnerabilities.'
+          echo 'WARNING: images are currently published without a vulnerability scan.'
+          echo 'Before production use, move the scan before publication or add a quarantine registry.'
+
+  deploy:
+    name: Argo CD Helm deployment (placeholder)
+    needs: [build, image-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Future GitOps handoff
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          echo 'PLACEHOLDER: update Helm image values in Git; let Argo CD reconcile the chart.'
+          echo "Candidate image: $IMAGE:$TAG ($DIGEST)"
+          echo 'No Helm values, GitOps repository, or Kubernetes resources are changed.'
