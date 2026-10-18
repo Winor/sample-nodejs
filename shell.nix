@@ -8,6 +8,7 @@ pkgs.mkShellNoCC {
     nodejs
     kubernetes-helm
     kubectl
+    actionlint
   ];
 
   PORT = "8181";
