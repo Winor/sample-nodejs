@@ -26,6 +26,11 @@ override `image.repository` and `image.tag`. Use immutable tags in CI; reused
 `latest` images with `IfNotPresent` can remain cached on nodes. Configure
 `imagePullSecrets` for a private registry.
 
+For Argo CD, use the [GitOps values and bootstrap runbook](../gitops/README.md).
+The shared image helper renders `repository@digest` whenever `image.digest` is set,
+otherwise it preserves the tag-based behavior above. Malformed digests fail Helm
+rendering. Both the Deployment and optional PostSync smoke Job use that same image.
+
 ## Configuration
 
 | Value | Default | Purpose |
@@ -33,6 +38,8 @@ override `image.repository` and `image.tag`. Use immutable tags in CI; reused
 | `replicaCount` | `1` | Replicas when autoscaling is disabled |
 | `image.repository` | `sample-nodejs` | Application image repository |
 | `image.tag` | `latest` | Image tag; an empty value uses chart appVersion (`1.0.0`) |
+| `image.digest` | empty | Immutable `sha256:...` identity; takes precedence over `image.tag` |
+| `postSyncCheck.enabled` | `false` | Argo CD PostSync Job checking all four HTTP endpoints through the Service |
 | `containerPort` | `8080` | Container port and application `PORT` environment variable |
 | `service.port` | `8080` | Service port, independently configurable from the container port |
 | `service.type` | `ClusterIP` | Internal service by default |
@@ -70,3 +77,7 @@ helm template sample-nodejs ./chart
 ```
 
 The Helm test checks `/ready`, `/my-app`, and `/metrics` through the Service.
+Argo CD skips that Helm hook and uses the opt-in PostSync Job instead. The Job
+reuses the scanned app image, and its pod labels intentionally do not match the
+application Service selector. Failed hooks fail the sync operation, not the Deployment
+itself, and do not trigger an automatic rollback.

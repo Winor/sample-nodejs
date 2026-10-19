@@ -1,0 +1,28 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: sample-nodejs
+  namespace: argocd
+spec:
+  description: Restricted project for the sample Node.js application
+  sourceRepos:
+    - https://github.com/Winor/sample-nodejs.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: sample-nodejs
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: batch
+      kind: Job
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute

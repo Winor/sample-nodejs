@@ -13,6 +13,12 @@ image:
   # Overrides the image tag whose default is the chart appVersion.
   # Matches npm run docker:build. Use immutable version tags in CI.
   tag: "latest"
+  # Takes precedence over tag. GitOps deployments use an immutable sha256 digest.
+  digest: ""
+
+# Argo CD runs this check after resources become healthy. Disabled for plain Helm.
+postSyncCheck:
+  enabled: false
 
 # Sets both the container port and the app's PORT environment variable.
 containerPort: 8080

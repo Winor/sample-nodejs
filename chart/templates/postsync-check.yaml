@@ -1,0 +1,66 @@
+{{- if .Values.postSyncCheck.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "chart.fullname" . }}-smoke
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 90
+  template:
+    metadata:
+      labels:
+        # Do not match the Service's application selector: this pod serves no HTTP.
+        app.kubernetes.io/name: {{ printf "%s-smoke" (include "chart.name" .) | quote }}
+        app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: {{ include "chart.serviceAccountName" . }}
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: smoke
+          # Reuse the scanned application image, not another unscanned test image.
+          image: {{ include "chart.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: TARGET_URL
+              value: {{ printf "http://%s:%v/" (include "chart.fullname" .) .Values.service.port | quote }}
+          command: ["node", "--input-type=module", "-e"]
+          args:
+            - |
+              for (const path of ['ready', 'live', 'my-app', 'metrics']) {
+                for (let attempt = 1; attempt <= 5; attempt++) {
+                  try {
+                    const response = await fetch(new URL(path, process.env.TARGET_URL), {
+                      signal: AbortSignal.timeout(3000),
+                    });
+                    if (response.status !== 200) throw new Error(path + ': HTTP ' + response.status);
+                    await response.arrayBuffer();
+                    console.log('PASS /' + path);
+                    break;
+                  } catch (error) {
+                    if (attempt === 5) throw error;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                  }
+                }
+              }
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+{{- end }}

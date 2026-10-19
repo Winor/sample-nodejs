@@ -1,0 +1,5 @@
+# Bootstrap separately: the application project cannot create cluster resources.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-nodejs

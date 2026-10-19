@@ -5,6 +5,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+    # Promotion PRs only change this file; Argo CD reconciles it without rebuilding.
+    # PR runs are deliberately NOT filtered, so required checks still run.
+    paths-ignore:
+      - gitops/image.json
   workflow_dispatch:
 
 permissions:
@@ -19,7 +23,7 @@ defaults:
     shell: bash
 
 jobs:
-  # Independent source checks → build → Trivy → smoke tests → publish → release.
+  # Independent checks → build → Trivy → smoke → publish → release/promotion PRs.
   sast:
     name: SAST (njsscan)
     runs-on: ubuntu-24.04
@@ -222,7 +226,90 @@ jobs:
             echo "| Published digest | \`${DIGEST:-not published}\` |"
             echo ''
             echo "Smoke endpoints: \`/ready\`, \`/live\`, \`/my-app\`, \`/metrics\`."
-            echo '> Argo CD deployment is not implemented.'
+            echo 'Deployment is promoted through a reviewed GitOps PR; CI does not access the cluster.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Propose GitOps image promotion
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Guard against stale promotion
+        id: current
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]; then
+            echo 'promote=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'promote=false' >> "$GITHUB_OUTPUT"
+            echo 'A newer main commit exists; leave promotion to its pipeline.'
+          fi
+
+      - name: Record scanned image digest
+        if: steps.current.outputs.promote == 'true'
+        env:
+          REPOSITORY: ${{ github.repository }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          TAG: ${{ needs.build.outputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node scripts/promote-image.cjs
+
+      - name: Open or update promotion PR
+        id: promotion
+        if: steps.current.outputs.promote == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          base: main
+          branch: gitops/promote-image
+          delete-branch: true
+          add-paths: gitops/image.json
+          commit-message: 'chore(gitops): promote scanned application image'
+          title: 'chore(gitops): promote scanned application image'
+          body: |
+            Promote the image built, scanned by Trivy, smoke-tested and published by:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Source commit: `${{ github.sha }}`
+            Image: `${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}`
+
+            Review the digest and CI checks before merging. Argo CD follows main.
+            This PR changes only deployment values; no rebuild is needed after merge.
+
+      - name: Write promotion summary
+        if: always()
+        env:
+          RESULT: ${{ steps.promotion.outcome }}
+          URL: ${{ steps.promotion.outputs.pull-request-url }}
+          CUSTOM_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
+        run: |
+          {
+            echo '## GitOps promotion'
+            echo "- PR step: ${RESULT:-skipped}"
+            echo "- Promotion PR: ${URL:-none}"
+            echo '- Cluster rollout occurs only after merge and Argo CD reconciliation.'
+            if [[ "$CUSTOM_TOKEN" != 'true' ]]; then
+              echo '> Configure RELEASE_PLEASE_TOKEN so promotion PRs trigger required CI checks.'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   release:

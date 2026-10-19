@@ -1,0 +1,22 @@
+# Deployment-specific values. Image identity lives in image.json, applied last.
+fullnameOverride: sample-nodejs
+
+# The app image can remain private even though the Git repository is public.
+# Provision this Secret in the sample-nodejs namespace before bootstrapping Argo CD.
+imagePullSecrets:
+  - name: ghcr-pull
+
+ingress:
+  enabled: true
+  # Empty uses the cluster's default IngressClass. Set explicitly for your cluster.
+  className: ""
+  hosts:
+    - host: nodejs.bnjmn.dev
+      paths:
+        - path: /my-app
+          pathType: Prefix
+  # Configure a certificate and TLS secret before exposing a production endpoint.
+  tls: []
+
+postSyncCheck:
+  enabled: true

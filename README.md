@@ -17,7 +17,8 @@ A lightweight Node.js application. It features basic web endpoints, Prometheus m
 
 ## Trunk-based CI/CD
 
-The [GitHub Actions workflow](.github/workflows/ci-cd.yml) has four real stages:
+The [GitHub Actions workflow](.github/workflows/ci-cd.yml) validates, publishes and
+proposes releases/deployments through Git:
 
 | Stage | Purpose | When |
 | --- | --- | --- |
@@ -25,20 +26,24 @@ The [GitHub Actions workflow](.github/workflows/ci-cd.yml) has four real stages:
 | Dependency audit | Block high/critical dependency vulnerabilities | Every run, in parallel with SAST |
 | Build | Build, Trivy-scan, smoke-test, and optionally publish the exact tested image | After both source security gates pass |
 | Release | Maintain a release PR or publish a merged release | After a successful build on pushes to `main` |
+| GitOps promotion | Propose the scanned/published image digest in a deployment PR | After a successful build on pushes to `main` |
 
 Trivy runs inside the build job **before registry login or publication**. Argo CD
-deployment is **not implemented** and is documented as follow-up work rather than
-represented by a successful no-op job.
+configuration follows reviewed deployment values on `main`; see the
+[GitOps bootstrap and verification runbook](gitops/README.md). This is repository
+setup only: no cluster has been bootstrapped and no live deployment is claimed.
 
 Use short-lived branches and pull requests into `main`. Pull requests build and
 smoke-test the image without publishing it. Pushes to `main` (and manual runs on
 `main`) publish the tested image to `ghcr.io/<owner>/<repository>`. Manual runs on
 other branches only validate the build. There are no environment branches or
-direct Kubernetes deployments.
+direct Kubernetes deployments from CI. A promotion-only push changing
+[gitops/image.json](gitops/image.json) skips CI to prevent a build/promotion loop;
+all pull requests still run the checks.
 
 ### Security gates
 
-Two independent source-check jobs must pass before the image can be built:
+Both source security checks must pass before the image can be built:
 
 - **SAST (njsscan)** scans [app.js](app.js) for insecure Node.js patterns. Error-level
 	findings and scanner failures block the build; warnings remain advisory. Expand
@@ -71,6 +76,8 @@ failed PR checks provide immediate feedback without duplicate tickets or additio
 write permissions. If issue tracking is added later, create or update deduplicated
 issues from trusted `main` or scheduled runs only, not from fork PRs. Configure
 branch protection to require both security checks as well as the build check.
+Helm/manifest validation and GitOps contract tests are not run in CI; they remain
+optional local checks described in the GitOps runbook.
 
 These checks do not replace dependency remediation or authorization review.
 Scan and audit results reflect advisory data available at scan time; the
@@ -94,7 +101,7 @@ workflow currently runs on PRs, pushes to `main`, and manual dispatch, not a sch
 - Publishes the exact tested local image only from `main`, using the built-in
 	`GITHUB_TOKEN` with job-scoped `packages: write` permission. PRs never log in.
 - Exposes image repository, version, tag, and published digest as job outputs for
-	the future GitOps handoff. A summary table records Trivy/smoke/publication outcomes,
+	the GitOps promotion PR. A summary table records Trivy/smoke/publication outcomes,
 	including failures, rather than always claiming success.
 
 The workflow's actions are pinned to commit hashes. The Docker build context is
@@ -146,13 +153,13 @@ the conventional subject and breaking-change footer in the resulting commit.
 
 #### Bootstrap and credentials
 
-[.release-please-manifest.json](.release-please-manifest.json) records the existing
-`1.0.0` package version as the initial baseline. The configured `bootstrap-sha`
-is the current committed baseline (`45b35ff192e78b67e3fc5adfe7bbc9514da1fec5`), so the
-first release considers subsequent commits rather than the repository's entire history.
-No initial tag needs to be created manually. The bootstrap boundary is ignored after
-the first Release Please release and can then be removed. Release Please maintains
-the manifest after initialization; do not bump it independently.
+[.release-please-manifest.json](.release-please-manifest.json) tracks the accepted
+package version (currently `1.0.1`). It was initialized at `1.0.0` with bootstrap
+commit `45b35ff192e78b67e3fc5adfe7bbc9514da1fec5`, so the first release considered
+subsequent commits rather than the repository's entire history. No initial tag
+needed to be created manually. The bootstrap boundary is ignored after the first
+Release Please release and can now be removed. Release Please maintains the
+manifest after initialization; do not bump it independently.
 
 Set the repository secret **`RELEASE_PLEASE_TOKEN`** to a fine-grained PAT or GitHub
 App installation token with repository Contents, Issues and Pull requests write
@@ -166,8 +173,9 @@ Without the custom token, the action falls back to `GITHUB_TOKEN` and warns in i
 summary. **PRs created/updated with `GITHUB_TOKEN` do not automatically trigger PR
 workflows.** Required checks may remain pending: configure the custom token before
 relying on unattended release PRs. Do not bypass required checks to merge them.
-The release job alone gets Contents, Issues and Pull requests write permissions;
-the PR security jobs retain read-only permissions.
+The release job gets Contents, Issues and Pull requests write permissions. The
+promotion job gets Contents and Pull requests write and reuses the custom token
+so its PR checks run too. The PR security jobs retain read-only permissions.
 
 #### Image identity
 
@@ -184,6 +192,25 @@ releases; it does not add bare version or `latest` container tags, publish to np
 or deploy Kubernetes resources. A rerun may overwrite the same commit image tag;
 use the published digest for exact image identity.
 
+### GitOps delivery
+
+Argo CD reads this public repository, renders [the chart](chart/README.md) with
+[deployment settings](gitops/values.yaml) and [a digest-pinned image](gitops/image.json),
+and reconciles only reviewed state on `main`. The GitOps project is restricted to
+the application's namespace and resource types. No kubeconfig or cluster-write
+credential is stored in GitHub Actions.
+
+The promotion job opens/updates a PR after a main image passes Trivy/smoke tests
+and publication. Merging that PR is the deployment approval; it does not rebuild
+or re-tag the image. Argo CD then syncs and runs a PostSync service smoke test using
+the same application image. The requested ingress host is `nodejs.bnjmn.dev` at
+`/my-app`; controller, DNS, TLS, registry pull credentials and Argo CD installation
+must be provisioned on the target cluster.
+
+See [gitops/README.md](gitops/README.md) for the same-repository choice, bootstrap,
+credentials, rollback and deployment evidence checklist. No cluster was changed
+while adding this repository configuration.
+
 Before production use:
 
 1. Configure a ruleset protecting `main`: require pull requests, both security checks,
@@ -197,6 +224,6 @@ Before production use:
 	the local load/push path.
 4. Configure Release Please credentials and require CI on its release PRs. Protect
 	release tags against changes and keep package/lockfile versions synchronized.
-5. Implement a GitOps change to Helm image values in Git, then let Argo CD reconcile
-	 the [chart](chart/README.md). Deployment is not implemented and
-	 needs no cluster credentials. The Helm image defaults are not updated by CI yet.
+5. Bootstrap Argo CD using the [GitOps runbook](gitops/README.md), configure private
+	image pulls, ingress/DNS/TLS, and verify Synced/Healthy state, PostSync success,
+	the deployed digest and browser access. These live checks remain outstanding.
