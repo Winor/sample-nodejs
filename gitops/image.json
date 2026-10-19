@@ -1,11 +1,12 @@
 {
   "image": {
     "repository": "ghcr.io/winor/sample-nodejs",
-    "tag": "1.0.1-ci.sha95571b890ea4772947a84591a30e92d02707c260",
-    "digest": "sha256:c51c0b013722966c26f9a4c7fec9761789f0f93e57e7e2d7848c9048a1b5e7da"
+    "tag": "1.1.0-ci.sha6fd91093f702caef8f1c5d76f3f09fb4931c5861",
+    "digest": "sha256:4073ba8e87823794216d50d7998374b4c8ae68b9a405e3c87c74ffb5038c3dae"
   },
   "promotion": {
-    "sourceCommit": "95571b890ea4772947a84591a30e92d02707c260",
-    "pipelineRun": "https://github.com/Winor/sample-nodejs/actions/runs/39299320565"
+    "sourceCommit": "6fd91093f702caef8f1c5d76f3f09fb4931c5861",
+    "pipelineRun": "https://github.com/Winor/sample-nodejs/actions/runs/39315307771",
+    "releaseTag": "v1.1.0"
   }
 }
