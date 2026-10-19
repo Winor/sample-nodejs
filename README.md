@@ -82,7 +82,10 @@ workflow currently runs on PRs, pushes to `main`, and manual dispatch, not a sch
 	versions agree. Image versions come directly from the checked-out package.
 - Builds the single-stage Dockerfile using Buildx and GitHub Actions layer cache.
 	Production dependencies are installed using `npm ci --omit=dev` and the committed
-	lockfile; this application has no compilation step.
+	lockfile; this application has no compilation step. After installation, npm,
+	Corepack and Yarn (including their bundled dependencies and command shims) are
+	removed from the runtime filesystem. The container starts directly with
+	`node app.js`; package managers are build-time tools, not runtime requirements.
 - Scans the loaded image with Trivy before any registry login or publication.
 - Uses [Docker Compose](compose.smoke.yml) to start the built Linux/amd64 image
 	as UID/GID 1000 with a read-only filesystem. A test service waits for the app's
