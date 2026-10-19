@@ -26,7 +26,7 @@ proposes releases/deployments through Git:
 | Dependency audit | Block high/critical dependency vulnerabilities | Every run, in parallel with SAST |
 | Build | Build, Trivy-scan, smoke-test, and optionally publish the exact tested image | After both source security gates pass |
 | Release | Maintain a release PR or publish a merged release | After a successful build on pushes to `main` |
-| GitOps promotion | Propose the scanned/published image digest in a deployment PR | After a successful build on pushes to `main` |
+| GitOps promotion | Propose the released image digest in a deployment PR | Only after Release Please creates a matching release |
 
 Trivy runs inside the build job **before registry login or publication**. Argo CD
 configuration follows reviewed deployment values on `main`; see the
@@ -200,8 +200,14 @@ and reconciles only reviewed state on `main`. The GitOps project is restricted t
 the application's namespace and resource types. No kubeconfig or cluster-write
 credential is stored in GitHub Actions.
 
-The promotion job opens/updates a PR after a main image passes Trivy/smoke tests
-and publication. Merging that PR is the deployment approval; it does not rebuild
+Ordinary feature merges build/scan/publish CI images and update the release PR,
+but do not propose deployment. After the release PR merges, its main build must
+pass Trivy/smoke tests and publication, and Release Please must create the release.
+Only then does the promotion job open/update a deployment PR. It fails closed if
+the release SHA or version differs from that run's scanned image, and records the
+accepted release tag in the deployment provenance.
+
+Merging the deployment PR is a separate approval; it does not rebuild
 or re-tag the image. Argo CD then syncs and runs a PostSync service smoke test using
 the same application image. The requested ingress host is `nodejs.bnjmn.dev` at
 `/my-app`; controller, DNS, TLS, registry pull credentials and Argo CD installation

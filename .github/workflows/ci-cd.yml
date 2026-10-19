@@ -23,7 +23,7 @@ defaults:
     shell: bash
 
 jobs:
-  # Independent checks → build → Trivy → smoke → publish → release/promotion PRs.
+  # Independent checks → build → Trivy → smoke → publish → release → promotion PR.
   sast:
     name: SAST (njsscan)
     runs-on: ubuntu-24.04
@@ -230,9 +230,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   promote:
-    name: Propose GitOps image promotion
-    needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    name: Propose released image promotion
+    needs: [build, release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.release.outputs.release_created == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -250,20 +250,9 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Guard against stale promotion
-        id: current
-        env:
-          SOURCE_SHA: ${{ github.sha }}
-        run: |
-          if [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]; then
-            echo 'promote=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'promote=false' >> "$GITHUB_OUTPUT"
-            echo 'A newer main commit exists; leave promotion to its pipeline.'
-          fi
-
-      - name: Record scanned image digest
-        if: steps.current.outputs.promote == 'true'
+      # A later feature commit on main must not discard this accepted release.
+      # The script verifies release identity against this run's scanned image.
+      - name: Verify release and record scanned image digest
         env:
           REPOSITORY: ${{ github.repository }}
           IMAGE: ${{ needs.build.outputs.image }}
@@ -271,11 +260,14 @@ jobs:
           TAG: ${{ needs.build.outputs.tag }}
           SOURCE_SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_CREATED: ${{ needs.release.outputs.release_created }}
+          RELEASE_SHA: ${{ needs.release.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
         run: node scripts/promote-image.cjs
 
       - name: Open or update promotion PR
         id: promotion
-        if: steps.current.outputs.promote == 'true'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
@@ -283,10 +275,12 @@ jobs:
           branch: gitops/promote-image
           delete-branch: true
           add-paths: gitops/image.json
-          commit-message: 'chore(gitops): promote scanned application image'
-          title: 'chore(gitops): promote scanned application image'
+          commit-message: 'chore(gitops): promote release ${{ needs.release.outputs.tag }}'
+          title: 'chore(gitops): promote release ${{ needs.release.outputs.tag }}'
           body: |
-            Promote the image built, scanned by Trivy, smoke-tested and published by:
+            Promote accepted release `${{ needs.release.outputs.tag }}`.
+            The release commit and version were verified against the image
+            built, scanned by Trivy, smoke-tested and published by:
             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             Source commit: `${{ github.sha }}`
@@ -300,10 +294,12 @@ jobs:
         env:
           RESULT: ${{ steps.promotion.outcome }}
           URL: ${{ steps.promotion.outputs.pull-request-url }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
           CUSTOM_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
         run: |
           {
             echo '## GitOps promotion'
+            echo "- Accepted release: $RELEASE_TAG"
             echo "- PR step: ${RESULT:-skipped}"
             echo "- Promotion PR: ${URL:-none}"
             echo '- Cluster rollout occurs only after merge and Argo CD reconciliation.'
@@ -318,6 +314,11 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag_name }}
     permissions:
       contents: write
       issues: write

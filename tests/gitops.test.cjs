@@ -15,6 +15,14 @@ const validEnv = {
   TAG: initial.image.tag,
   SOURCE_SHA: initial.promotion.sourceCommit,
   RUN_URL: initial.promotion.pipelineRun,
+  RELEASE_CREATED: 'true',
+  RELEASE_SHA: initial.promotion.sourceCommit,
+  RELEASE_VERSION: initial.image.tag.split('-ci.sha')[0],
+  RELEASE_TAG: `v${initial.image.tag.split('-ci.sha')[0]}`,
+};
+const expectedPromotion = {
+  ...initial,
+  promotion: { ...initial.promotion, releaseTag: validEnv.RELEASE_TAG },
 };
 
 function helm(...args) {
@@ -26,7 +34,7 @@ function helm(...args) {
 }
 
 test('promotion records the published image and pipeline provenance', () => {
-  assert.deepEqual(promotionValues(validEnv), initial);
+  assert.deepEqual(promotionValues(validEnv), expectedPromotion);
 });
 
 for (const [field, value] of [
@@ -39,6 +47,11 @@ for (const [field, value] of [
   ['TAG', 'latest'],
   ['RUN_URL', 'https://example.com/untrusted'],
   ['RUN_URL', 'https://github.com/Winor/sample-nodejs/actions/runs/123/extra'],
+  ['RELEASE_CREATED', 'false'],
+  ['RELEASE_CREATED', ''],
+  ['RELEASE_SHA', 'b'.repeat(40)],
+  ['RELEASE_VERSION', '99.0.0'],
+  ['RELEASE_TAG', 'v99.0.0'],
 ]) {
   test(`promotion rejects invalid ${field}: ${value || '(empty)'}`, () => {
     assert.throws(() => promotionValues({ ...validEnv, [field]: value }));
@@ -53,7 +66,7 @@ test('promotion CLI only writes the designated deployment values', t => {
     cwd: directory, encoding: 'utf8', env: { ...process.env, ...validEnv },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'gitops/image.json'))), initial);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'gitops/image.json'))), expectedPromotion);
   assert.deepEqual(fs.readdirSync(directory), ['gitops']);
 });
 
@@ -69,7 +82,7 @@ test('GitOps renders the same immutable image in Deployment and PostSync Job', (
   assert.equal(result.status, 0, result.stderr);
   const image = `${initial.image.repository}@${initial.image.digest}`;
   assert.equal(result.stdout.split(`image: "${image}"`).length - 1, 2);
-  assert.match(result.stdout, /host: "?nodejs\.bnjmn\.deb"?/);
+  assert.match(result.stdout, /host: "?nodejs\.bnjmn\.dev"?/);
   assert.match(result.stdout, /name: ghcr-pull/);
   assert.match(result.stdout, /argocd.argoproj.io\/hook: PostSync/);
   assert.doesNotMatch(result.stdout, /image: .*:latest/);
@@ -104,11 +117,23 @@ test('workflow gates promotion and prevents recursive promotion-only push runs',
   const pr = workflow.split('\n  pull_request:\n')[1].split('\n  push:')[0];
   assert.doesNotMatch(pr, /paths/);
   const promotion = workflow.split('\n  promote:\n')[1].split('\n  release:\n')[0];
-  assert.match(promotion, /needs: build/);
+  assert.match(promotion, /needs: \[build, release\]/);
   assert.match(promotion, /github.ref == 'refs\/heads\/main' && github.event_name == 'push'/);
+  assert.match(promotion, /needs.release.outputs.release_created == 'true'/);
+  assert.match(promotion, /RELEASE_SHA: \$\{\{ needs.release.outputs.sha \}\}/);
+  assert.match(promotion, /RELEASE_VERSION: \$\{\{ needs.release.outputs.version \}\}/);
   assert.match(promotion, /add-paths: gitops\/image\.json/);
-  assert.match(promotion, /git rev-parse HEAD/);
+  assert.doesNotMatch(promotion, /git rev-parse HEAD/);
   assert.doesNotMatch(promotion, /continue-on-error|kubectl|argocd app sync/);
+});
+
+test('release job exports creation status and image identity for promotion', () => {
+  const workflow = fs.readFileSync(path.join(root, '.github/workflows/ci-cd.yml'), 'utf8');
+  const release = workflow.split('\n  release:\n')[1];
+  assert.match(release, /release_created: \$\{\{ steps.release.outputs.release_created \}\}/);
+  assert.match(release, /sha: \$\{\{ steps.release.outputs.sha \}\}/);
+  assert.match(release, /version: \$\{\{ steps.release.outputs.version \}\}/);
+  assert.match(release, /tag: \$\{\{ steps.release.outputs.tag_name \}\}/);
 });
 
 test('Argo CD follows reviewed main values within a restricted project', () => {
