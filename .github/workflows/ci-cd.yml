@@ -19,16 +19,7 @@ defaults:
     shell: bash
 
 jobs:
-  version:
-    name: SemVer release (placeholder)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Future release automation
-        run: |
-          echo 'PLACEHOLDER: derive the next SemVer release from merged changes on main.'
-          echo 'No version bumps, Git tags, or GitHub releases are created yet.'
-
+  # Independent source checks → build → Trivy → smoke tests → publish → release.
   sast:
     name: SAST (njsscan)
     runs-on: ubuntu-24.04
@@ -67,15 +58,16 @@ jobs:
 
   build:
     name: Build, smoke-test and publish image
-    needs: [version, sast, dependency-audit]
+    needs: [sast, dependency-audit]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
     outputs:
       image: ${{ steps.metadata.outputs.image }}
       tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
       digest: ${{ steps.publish.outputs.digest }}
     steps:
       - name: Check out source
@@ -101,10 +93,16 @@ jobs:
         run: |
           version=$(node -p 'require("./package.json").version')
           if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo 'Expected a stable SemVer package version (X.Y.Z).' >&2
+            echo 'Expected a stable package version (X.Y.Z).' >&2
             exit 1
           fi
-
+          node -e '
+            const assert = require("node:assert/strict");
+            const version = require("./package.json").version;
+            const lock = require("./package-lock.json");
+            assert.equal(lock.version, version, "Lockfile version must match package.json");
+            assert.equal(lock.packages[""].version, version, "Lockfile root version must match package.json");
+          '
           image="ghcr.io/${REPOSITORY,,}"
           if [[ "$EVENT_NAME" == 'pull_request' ]]; then
             tag="${version}-pr.${PR_NUMBER}.sha${COMMIT_SHA}"
@@ -136,12 +134,33 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.metadata.outputs.tag }}
+            org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # The local Docker load/push path does not retain attestations.
           provenance: false
           sbom: false
+
+      # Scan the exact local image before any registry login or push. Findings
+      # without available fixes also block publication; scan errors fail closed.
+      - name: Scan image with Trivy (high and critical)
+        id: trivy
+        timeout-minutes: 10
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.0
+          scan-type: image
+          image-ref: ${{ steps.metadata.outputs.ref }}
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: 'false'
+          exit-code: '1'
+          format: table
+          timeout: 5m
+        env:
+          # Do not fall back to pulling a different image from a registry.
+          TRIVY_IMAGE_SRC: docker
 
       - name: Smoke-test the built image
         id: smoke
@@ -164,7 +183,7 @@ jobs:
 
       # Fork PRs and manual runs on non-main branches never log in or publish.
       - name: Log in to GitHub Container Registry
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.trivy.outcome == 'success' && steps.smoke.outcome == 'success'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -173,7 +192,7 @@ jobs:
 
       - name: Publish the tested image
         id: publish
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.trivy.outcome == 'success' && steps.smoke.outcome == 'success'
         env:
           IMAGE_REF: ${{ steps.metadata.outputs.ref }}
         run: |
@@ -182,48 +201,76 @@ jobs:
           echo "digest=${reference#*@}" >> "$GITHUB_OUTPUT"
 
       - name: Write build summary
+        if: always()
         env:
           IMAGE_REF: ${{ steps.metadata.outputs.ref }}
+          VERSION: ${{ steps.metadata.outputs.version }}
           DIGEST: ${{ steps.publish.outputs.digest }}
+          TRIVY_RESULT: ${{ steps.trivy.outcome }}
+          SMOKE_RESULT: ${{ steps.smoke.outcome }}
+          PUBLISH_RESULT: ${{ steps.publish.outcome }}
         run: |
           {
-            echo '## Build and Dockerize'
-            echo "- Image: \`$IMAGE_REF\`"
-            echo '- Container smoke checks: /ready, /live, /my-app, /metrics'
-            if [[ -n "$DIGEST" ]]; then
-              echo "- Published digest: \`$DIGEST\`"
-            else
-              echo '- Validation only: image was not published.'
-            fi
-            echo '- Security gates passed: njsscan (errors), npm audit (high/critical).'
-            echo '- SemVer releases, image vulnerability scanning and Argo CD deployment are placeholders.'
+            echo '## 📦 Container build'
+            echo '| Item | Result |'
+            echo '| --- | --- |'
+            echo "| Package version | \`${VERSION:-unavailable}\` |"
+            echo "| Image | \`${IMAGE_REF:-unavailable}\` |"
+            echo "| Trivy (high/critical, including unfixed) | ${TRIVY_RESULT:-skipped} |"
+            echo "| Smoke tests | ${SMOKE_RESULT:-skipped} |"
+            echo "| Publication | ${PUBLISH_RESULT:-skipped} |"
+            echo "| Published digest | \`${DIGEST:-not published}\` |"
+            echo ''
+            echo "Smoke endpoints: \`/ready\`, \`/live\`, \`/my-app\`, \`/metrics\`."
+            echo '> Argo CD deployment is not implemented.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  image-scan:
-    name: Image vulnerability scan (placeholder)
+  release:
+    name: Release PR and GitHub release
     needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     steps:
-      - name: Future image security gate
-        run: |
-          echo 'PLACEHOLDER: scan the image and fail on high/critical vulnerabilities.'
-          echo 'WARNING: images are currently published without a vulnerability scan.'
-          echo 'Before production use, move the scan before publication or add a quarantine registry.'
+      # A PAT or App token lets release PR events trigger the normal PR checks.
+      # The built-in token works, but its PR events do not start other workflows.
+      - name: Maintain release PR or publish merged release
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          target-branch: main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
 
-  deploy:
-    name: Argo CD Helm deployment (placeholder)
-    needs: [build, image-scan]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Future GitOps handoff
+      - name: Write release summary
+        if: always()
         env:
-          IMAGE: ${{ needs.build.outputs.image }}
-          TAG: ${{ needs.build.outputs.tag }}
-          DIGEST: ${{ needs.build.outputs.digest }}
+          RELEASE_RESULT: ${{ steps.release.outcome }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_URL: ${{ steps.release.outputs.html_url }}
+          PRS_CREATED: ${{ steps.release.outputs.prs_created }}
+          CUSTOM_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
         run: |
-          echo 'PLACEHOLDER: update Helm image values in Git; let Argo CD reconcile the chart.'
-          echo "Candidate image: $IMAGE:$TAG ($DIGEST)"
-          echo 'No Helm values, GitOps repository, or Kubernetes resources are changed.'
+          {
+            echo '## 🚀 Release Please'
+            echo '| Item | Result |'
+            echo '| --- | --- |'
+            echo "| Automation | $RELEASE_RESULT |"
+            echo "| Release PR created/updated | ${PRS_CREATED:-false} |"
+            echo "| Release created | ${RELEASE_CREATED:-false} |"
+            echo "| Release tag | ${RELEASE_TAG:-none} |"
+            if [[ -n "$RELEASE_URL" ]]; then
+              echo "| GitHub release | $RELEASE_URL |"
+            fi
+            echo ''
+            echo 'Merge the release PR to accept package/lockfile versions and release notes.'
+            if [[ "$CUSTOM_TOKEN" != 'true' ]]; then
+              echo '> ⚠️ Configure RELEASE_PLEASE_TOKEN so generated release PRs trigger CI automatically. Do not merge an unchecked release PR.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
