@@ -1,0 +1,56 @@
+# Test the exact locally built image, without rebuilding or pulling it.
+x-runtime: &runtime
+  image: ${IMAGE_REF:?Set IMAGE_REF to the locally built image tag}
+  pull_policy: never
+  user: "1000:1000"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: "no"
+
+services:
+  app:
+    <<: *runtime
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:8080/ready', { signal: AbortSignal.timeout(2000) })
+          .then(response => process.exit(response.status === 200 ? 0 : 1))
+          .catch(() => process.exit(1))
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
+  smoke:
+    <<: *runtime
+    depends_on:
+      app:
+        condition: service_healthy
+    # Reuse Node.js from the app image instead of pulling a separate test image.
+    entrypoint: ["node", "--input-type=module", "-e"]
+    command:
+      - |
+        for (const path of ['ready', 'live', 'my-app', 'metrics']) {
+          const response = await fetch('http://app:8080/' + path, {
+            signal: AbortSignal.timeout(5000),
+          });
+          if (response.status !== 200) {
+            throw new Error('/' + path + ' returned HTTP ' + response.status);
+          }
+          await response.arrayBuffer();
+          console.log('PASS /' + path);
+        }
+
+# No host ports or external network access are needed for these checks.
+networks:
+  default:
+    internal: true

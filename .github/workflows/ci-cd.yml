@@ -30,18 +30,44 @@ jobs:
           echo 'No version bumps, Git tags, or GitHub releases are created yet.'
 
   sast:
-    name: SAST and dependency checks (placeholder)
+    name: SAST (njsscan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Error-level findings and scanner failures block the build; warnings are advisory.
+      - name: Scan Node.js source
+        uses: ajinabraham/njsscan-action@231750a435d85095d33be7d192d52ec650625146 # v9
+        with:
+          args: 'app.js'
+
+  dependency-audit:
+    name: Dependency audit (npm)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Future security gate
-        run: |
-          echo 'PLACEHOLDER: run SAST and dependency checks; block on policy violations.'
-          echo 'WARNING: this job does not perform security checks.'
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      # Audit the committed dependency graph, including dev dependencies, without
+      # installing packages or running lifecycle scripts. Registry errors also fail.
+      - name: Audit locked dependencies (high and critical)
+        run: npm audit --package-lock-only --audit-level=high
 
   build:
     name: Build, smoke-test and publish image
-    needs: [version, sast]
+    needs: [version, sast, dependency-audit]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -118,20 +144,23 @@ jobs:
           sbom: false
 
       - name: Smoke-test the built image
+        id: smoke
+        timeout-minutes: 3
         env:
           IMAGE_REF: ${{ steps.metadata.outputs.ref }}
-        run: |
-          container=$(docker run --detach --read-only --cap-drop=ALL \
-            --security-opt=no-new-privileges --user 1000:1000 \
-            --publish 127.0.0.1::8080 "$IMAGE_REF")
-          trap 'docker logs "$container"; docker rm --force "$container" >/dev/null' EXIT
-          port=$(docker port "$container" 8080/tcp | awk -F: '{print $NF}')
+        run: docker compose -f compose.smoke.yml up --no-build --abort-on-container-exit --exit-code-from smoke
 
-          for path in ready live my-app metrics; do
-            curl --fail --silent --show-error --max-time 5 \
-              --retry 10 --retry-delay 1 --retry-all-errors --retry-max-time 60 \
-              --output /dev/null "http://127.0.0.1:${port}/${path}"
-          done
+      - name: Collect smoke-test logs
+        if: always() && steps.smoke.outcome != 'skipped'
+        env:
+          IMAGE_REF: ${{ steps.metadata.outputs.ref }}
+        run: docker compose -f compose.smoke.yml logs --no-color
+
+      - name: Clean up smoke-test services
+        if: always() && steps.smoke.outcome != 'skipped'
+        env:
+          IMAGE_REF: ${{ steps.metadata.outputs.ref }}
+        run: docker compose -f compose.smoke.yml down --volumes --remove-orphans
 
       # Fork PRs and manual runs on non-main branches never log in or publish.
       - name: Log in to GitHub Container Registry
@@ -166,7 +195,8 @@ jobs:
             else
               echo '- Validation only: image was not published.'
             fi
-            echo '- SemVer releases, security scanning and Argo CD deployment are placeholders.'
+            echo '- Security gates passed: njsscan (errors), npm audit (high/critical).'
+            echo '- SemVer releases, image vulnerability scanning and Argo CD deployment are placeholders.'
           } >> "$GITHUB_STEP_SUMMARY"
 
   image-scan:
